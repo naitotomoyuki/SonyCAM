@@ -1,157 +1,143 @@
-// CAM1_stream_bayer.cpp  io—Í–¼‚Í‚±‚ê‚Ü‚Å’Ê‚è CAM1.exe ‚ÅOKj
-#include "stdafx.h"   // ©PCH‚ğg‚Á‚Ä‚¢‚éê‡‚¾‚¯c‚·iæ“ªj
+ï»¿// CAM1_bridge_min.cpp  â€” PCHç„¡ã—ãƒ»ã‚¹ãƒ¬ãƒƒãƒ‰ç„¡ã—ã®é€£ç¶šã‚­ãƒ£ãƒ—ãƒãƒ£ç‰ˆ
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
-#include <atomic>
-#include <thread>
-#include <chrono>
-#include <iostream>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <memory>
-#include <cstdint>
-#include <cstring>
 #include "SonyCam.h"
 
-#pragma comment(lib, "Ws2_32.lib")
-
-// ‹¤—Lƒƒ‚ƒŠƒwƒbƒ_
-#pragma pack(push, 1)
+#pragma pack(push,1)
 struct ShmHeader {
-    uint32_t magic;         // 'CBRG'
-    uint32_t width;
-    uint32_t height;
-    uint32_t bpp;           // 8 for Bayer8
-    uint32_t stride;        // 4-byte aligned
-    uint64_t frame_id;      // Š®—¹‚²‚Æ‚É +1
-    uint64_t timestamp_us;  // Ql
-    uint32_t seq;           // —\–ñi«—ˆ—pj
+    uint32_t magic;       // 'CBRG' = 0x47524243
+    uint32_t width, height;
+    uint32_t bpp;         // 8/24/32...
+    uint32_t stride;      // 4byte align
+    uint64_t frame_id;    // +1/Frame
+    uint64_t timestamp_us;
+    uint32_t seq;
     uint32_t reserved;
 };
 #pragma pack(pop)
 
-// cc‘O—ªiƒwƒbƒ_‚â ShmHeader ‚Í‚»‚Ì‚Ü‚Üjcc
-
-static std::unique_ptr<CSonyCam> gCam;
-static PBITMAPINFO gBmi = nullptr;
-
-static HANDLE gMap = nullptr;
-static ShmHeader* gHdr = nullptr;
-static uint8_t* gPixels = nullptr;
-static size_t     gImgBytes = 0;
-
-static std::atomic<bool> gRunning{ true };
-
-static inline uint32_t aligned_stride(uint32_t w, uint32_t bpp) {
-    const uint32_t bytes = bpp / 8;
+static inline uint32_t aligned_stride(uint32_t w, uint32_t bppBits) {
+    const uint32_t bytes = bppBits / 8;
     return ((w * bytes + 3) / 4) * 4;
 }
 
-static void die(const char* m, DWORD e = GetLastError()) {
-    std::cerr << m << " (err=" << e << ")\n";
-    ExitProcess(1);
+// ãƒ‘ã‚¤ãƒ—ã‹ã‚‰ finalize/quit/exit ãŒæ¥ãŸã‚‰æ­¢ã‚ã‚‹ï¼ˆéãƒ–ãƒ­ãƒƒã‚­ãƒ³ã‚°ï¼‰
+static bool poll_finalize_nonblock() {
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn == INVALID_HANDLE_VALUE) return false;
+    if (GetFileType(hIn) == FILE_TYPE_PIPE) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(hIn, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            std::string line;
+            if (std::getline(std::cin, line)) {
+                if (line == "finalize" || line == "quit" || line == "exit") return true;
+            }
+        }
+    }
+    return false; // ã‚³ãƒ³ã‚½ãƒ¼ãƒ«ç›´çµæ™‚ã¯ Ctrl+C ã§çµ‚äº†æƒ³å®š
 }
 
 int main() {
-    std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
+    // å…±æœ‰ãƒ¡ãƒ¢ãƒªåã‚’ ASCII ã§å—ã‘å–ã‚‹ï¼ˆPython ã¯ "Local\\Cam1Mem\n" ã‚’é€ã‚‹ï¼‰
+    char shmA[256];
+    std::fputs("Enter the shared memory name: ", stdout);
+    std::fflush(stdout);
+    if (!std::fgets(shmA, sizeof(shmA), stdin)) shmA[0] = '\0';
+    size_t n = std::strlen(shmA);
+    while (n && (shmA[n - 1] == '\r' || shmA[n - 1] == '\n')) shmA[--n] = '\0';
+    if (n == 0) std::strcpy(shmA, "Local\\Cam1Mem");
 
-    // ‹¤—Lƒƒ‚ƒŠ–¼iASCIIj
-    std::string shmA;
-    std::cerr << "Enter the shared memory name: ";
-    std::getline(std::cin, shmA);
-    if (shmA.empty()) shmA = "Local\\Cam1Mem";
-    std::wstring shmW(shmA.begin(), shmA.end());
+    // ANSI â†’ UTF-16
+    wchar_t shmW[256];
+    int wlen = MultiByteToWideChar(CP_ACP, 0, shmA, -1, shmW, 256);
+    if (wlen <= 0) std::wcscpy(shmW, L"Local\\Cam1Mem");
 
-    // ---- ƒJƒƒ‰‰Šú‰»iPixelFormat‚ÍŒÅ’è‚¹‚¸ASDK‚É”C‚¹‚éj----
-    try {
-        gCam = std::make_unique<CSonyCam>();
-        gCam->SetMaxPacketSize();
-        gCam->SetFeature("AcquisitionMode", "Continuous");
-        gCam->SetFeature("TriggerMode", "Off");
-        gCam->SetFeature("ExposureAuto", "Continuous");
-        gCam->SetFeature("GainAuto", "Continuous");
+    // ã‚«ãƒ¡ãƒ©åˆæœŸåŒ–
+    std::unique_ptr<CSonyCam> cam(new CSonyCam());
+    cam->SetMaxPacketSize();
+    cam->SetFeature("AcquisitionMode", "Continuous");
+    cam->SetFeature("TriggerMode", "Off");
+    cam->SetFeature("ExposureAuto", "Continuous");
+    cam->SetFeature("GainAuto", "Continuous");
+    cam->StreamStart();
 
-        gCam->StreamStart();
-        gBmi = gCam->GetBMPINFO();
-    }
-    catch (...) {
-        std::cerr << "Unknown error during camera initialization.\n";
-        return 1;
-    }
+    // ã‚¦ã‚©ãƒ¼ãƒ ã‚¢ãƒƒãƒ—ï¼ˆé»’å›é¿ï¼‰
+    PBITMAPINFO bmi0 = cam->GetBMPINFO();
+    std::unique_ptr<BYTE[]> warm(new BYTE[bmi0->bmiHeader.biSizeImage]);
+    for (int i = 0;i < 3;++i) (void)cam->Capture(warm.get());
 
-    const uint32_t W = gBmi->bmiHeader.biWidth;
-    const uint32_t H = gBmi->bmiHeader.biHeight;
-    const uint32_t BPP = gBmi->bmiHeader.biBitCount;           // 8 / 24 / 32 ‚È‚Ç
-    const uint32_t STRIDE = aligned_stride(W, BPP);
-    gImgBytes = static_cast<size_t>(STRIDE) * H;
+    PBITMAPINFO bmi = cam->GetBMPINFO();
+    uint32_t W = bmi->bmiHeader.biWidth;
+    uint32_t H = bmi->bmiHeader.biHeight;
+    uint32_t BPP = bmi->bmiHeader.biBitCount;
+    uint32_t STRIDE = aligned_stride(W, BPP);
+    size_t   IMG_BYTES = (size_t)STRIDE * H;
+    size_t   capBytes = (size_t)bmi->bmiHeader.biSizeImage;
+    size_t   copyBytes = (capBytes < IMG_BYTES) ? capBytes : IMG_BYTES;
 
-    // ‹¤—Lƒƒ‚ƒŠŠm•Ûiƒwƒbƒ_{ÀƒoƒCƒg”j
-    const DWORD total = static_cast<DWORD>(sizeof(ShmHeader) + gImgBytes);
-    gMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, total, shmW.c_str());
-    if (!gMap) die("CreateFileMapping failed");
-    void* base = MapViewOfFile(gMap, FILE_MAP_ALL_ACCESS, 0, 0, total);
-    if (!base) die("MapViewOfFile failed");
-    gHdr = reinterpret_cast<ShmHeader*>(base);
-    gPixels = reinterpret_cast<uint8_t*>(gHdr + 1);
+    // å…±æœ‰ãƒ¡ãƒ¢ãƒªï¼ˆãƒ˜ãƒƒãƒ€ + å®Ÿéš›ã«ã‚³ãƒ”ãƒ¼ã™ã‚‹ãƒã‚¤ãƒˆæ•°ï¼‰
+    DWORD TOTAL = (DWORD)(sizeof(ShmHeader) + copyBytes);
+    HANDLE hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, TOTAL, shmW);
+    if (!hMap) { std::fprintf(stderr, "CreateFileMapping failed: %lu\n", GetLastError()); return 1; }
+    void* base = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, TOTAL);
+    if (!base) { std::fprintf(stderr, "MapViewOfFile failed: %lu\n", GetLastError()); CloseHandle(hMap); return 1; }
 
-    // ƒwƒbƒ_‰Šú‰»i**DIB î•ñ‚É‡‚í‚¹‚é**j
-    gHdr->magic = 0x47524243; // 'CBRG'
-    gHdr->width = W;
-    gHdr->height = H;
-    gHdr->bpp = BPP;
-    gHdr->stride = STRIDE;
-    gHdr->frame_id = 0;
-    gHdr->timestamp_us = 0;
-    gHdr->seq = 0;
-    gHdr->reserved = 0;
+    ShmHeader* hdr = (ShmHeader*)base;
+    uint8_t* px = (uint8_t*)(hdr + 1);
+    hdr->magic = 0x47524243; hdr->width = W; hdr->height = H; hdr->bpp = BPP; hdr->stride = STRIDE;
+    hdr->frame_id = 0; hdr->timestamp_us = 0; hdr->seq = 0; hdr->reserved = 0;
 
-    // ‹N“®î•ñistdoutj
-    std::cout << gCam->GetSerialNumber() << "\n";
-    std::cout << "WH " << W << " " << H << " BPP " << BPP << " STRIDE " << STRIDE << "\n";
+    // èµ·å‹•æƒ…å ±ã‚’ stdout ã¸ï¼ˆPythonãŒæ‹¾ã†ï¼‰
+    std::string serial = cam->GetSerialNumber();
+    std::puts(serial.c_str());
+    std::printf("WH %u %u BPP %u STRIDE %u\n", W, H, BPP, STRIDE);
+    std::fflush(stdout);
 
-    // ƒ[ƒJƒ‹ƒtƒŒ[ƒ€i**•K‚¸ biSizeImage •ª**j
-    const size_t capBytes = static_cast<size_t>(gBmi->bmiHeader.biSizeImage);
+    // ãƒ•ãƒ¬ãƒ¼ãƒ ãƒãƒƒãƒ•ã‚¡ï¼ˆå¿…ãš biSizeImage åˆ†ï¼‰
     std::unique_ptr<BYTE[]> frame(new BYTE[capBytes]);
 
-    // ƒEƒH[ƒ€ƒAƒbƒv
-    for (int i = 0;i < 2;i++) gCam->Capture(frame.get());
+    // é€£ç¶šã‚­ãƒ£ãƒ—ãƒãƒ£
+    uint64_t local_id = 0;
+    for (;;) {
+        if (poll_finalize_nonblock()) break;
 
-    // ƒLƒƒƒvƒ`ƒƒƒXƒŒƒbƒhFí frame ‚Éó‚¯‚é¨‹¤—Lƒƒ‚ƒŠ‚Ö memcpy
-    std::thread capthr([&] {
-        while (gRunning.load(std::memory_order_relaxed)) {
-            bool ok = gCam->Capture(frame.get());
-            (void)ok;
-            const size_t bytes = (capBytes < gImgBytes) ? capBytes : gImgBytes;
-            std::memcpy(gPixels, frame.get(), bytes);
-            gHdr->frame_id++;
-            gHdr->timestamp_us = GetTickCount64() * 1000ULL; // ‚¨èŒy
-            std::atomic_thread_fence(std::memory_order_release);
-        }
-        });
+        bool ok = cam->Capture(frame.get());
 
-    // §ŒäƒXƒŒƒbƒhFfinalize/quit/exit ‚Å’â~BEOF ‚Í–³‹i= ‰½‚à—ˆ‚È‚¯‚ê‚Î‘–‚è‘±‚¯‚éj
-    std::thread ctlthr([&] {
-        std::string cmd;
-        while (true) {
-            if (!std::getline(std::cin, cmd)) {
-                // EOF ¨ –³‹‚µ‚Ä‘±siPython ‚ª‰½‚à‘—‚ç‚È‚¢‘z’èj
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                continue;
-            }
-            if (cmd == "finalize" || cmd == "quit" || cmd == "exit") {
-                gRunning.store(false, std::memory_order_relaxed);
-                break;
+        // å…ˆé ­64KBã§ã‚¼ãƒ­æ¤œçŸ¥ â†’ ãƒ†ã‚¹ãƒˆãƒ‘ã‚¿ãƒ¼ãƒ³æ³¨å…¥
+        size_t PROBE = (copyBytes < (size_t)65536) ? copyBytes : (size_t)65536;
+        unsigned long long sum = 0;
+        for (size_t i = 0;i < PROBE;++i) sum += frame[i];
+        if (!ok || sum == 0ULL) {
+            int bppB = (int)(BPP / 8);
+            for (uint32_t y = 0;y < H;++y) {
+                BYTE* row = frame.get() + (size_t)y * STRIDE;
+                for (uint32_t x = 0;x < W;++x) {
+                    BYTE B = (BYTE)(x & 0xFF), G = (BYTE)(y & 0xFF), R = (BYTE)((x + y) & 0xFF);
+                    if (bppB >= 3) {
+                        row[x * bppB + 0] = B; row[x * bppB + 1] = G; row[x * bppB + 2] = R;
+                        if (bppB == 4) row[x * 4 + 3] = 255;
+                    }
+                    else {
+                        row[x] = B; // Mono8
+                    }
+                }
             }
         }
-        });
 
-    // ‚±‚±‚Å‘Ò‹@
-    ctlthr.join();
-    gRunning.store(false, std::memory_order_relaxed);
-    capthr.join();
+        std::memcpy(px, frame.get(), copyBytes);
+        hdr->frame_id = ++local_id;
+        hdr->timestamp_us = GetTickCount64() * 1000ULL;
+        // Sleep(0); // å¿…è¦ã«å¿œã˜ã¦è² è·èª¿æ•´
+    }
 
-    gCam->StreamStop();
-    if (gHdr)    UnmapViewOfFile(gHdr);
-    if (gMap)    CloseHandle(gMap);
+    cam->StreamStop();
+    UnmapViewOfFile(base);
+    CloseHandle(hMap);
     return 0;
 }
-
