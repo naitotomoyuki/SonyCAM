@@ -23,12 +23,14 @@ static void die(const char* m, DWORD e = GetLastError()) {
     ExitProcess(1);
 }
 
-static void InitSharedMemory() {
+static bool InitSharedMemory() {
     gMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)kShmSize, kShmName);
-    if (!gMap) die("CreateFileMapping failed");
+    if (!gMap) return false;
     gBuf = MapViewOfFile(gMap, FILE_MAP_ALL_ACCESS, 0, 0, kShmSize);
-    if (!gBuf) die("MapViewOfFile failed");
+    if (!gBuf) { CloseHandle(gMap); gMap = nullptr; return false; }
+    return true;
 }
+
 
 static void InitCamera() {
     gCam = std::make_unique<CSonyCam>();
@@ -40,15 +42,17 @@ static void InitCamera() {
     gFrame = std::make_unique<BYTE[]>(gBmi->bmiHeader.biSizeImage);
 
     std::string serial = gCam->GetSerialNumber();
-    std::cerr << serial << std::endl;  // © Python ‘¤‚ªÅ‰‚É“Ç‚Þ1s
+    //std::cerr << serial << std::endl;  // © Python ‘¤‚ªÅ‰‚É“Ç‚Þ1s
+    std::cout << serial << std::endl;
 }
 
 static void FiniCamera() {
     if (gCam) { gCam->StreamStop(); gCam.reset(); }
 }
 
+
 int main() {
-    InitSharedMemory();
+    if (!InitSharedMemory()) { std::cerr << "SHM init failed\n"; return 1; }
     try { InitCamera(); }
     catch (...) {
         std::cerr << "Unknown error during camera initialization." << std::endl;
