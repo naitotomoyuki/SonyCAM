@@ -6,7 +6,7 @@ import cv2
 
 LIBDIR = Path(__file__).resolve().parent / "lib"
 EXE    = LIBDIR / "CAM1.exe"
-SHM    = r"Local\Cam1Mem_test"     # ← CAM1.exe に打った名前と一致させる
+SHM    = r"Local\Cam1Mem"     # ← CAM1.exe に打った名前と一致させる
 W,H,BPP,STRIDE = 2464, 2056, 32, 9856
 BYTES_PER_PIXEL = BPP // 8
 TOTAL = H * STRIDE
