@@ -31,7 +31,7 @@ class FixedCamera:
         if path_parts:
             env["PATH"] = os.pathsep.join(path_parts + [env.get("PATH","")])
 
-        # stdout と stderr を1本化（どちらに出しても拾えるように）
+        # stdout/stderrを一本化、stdinもパイプに
         self.proc = subprocess.Popen(
             [str(exe_path)],
             stdin=subprocess.PIPE,
@@ -46,16 +46,14 @@ class FixedCamera:
         if self.debug:
             print("[cam] launched:", exe_path)
 
-        # 共有メモリ名を UTF-16LE + CRLF で送る（wcin対応）
-        shm_wide = self.SHM_NAME.encode("utf-16le") + b"\x0d\x00\x0a\x00"
-        self.proc.stdin.write(shm_wide)
+        # 共有メモリ名は ASCII で（C++ を cin に統一した前提）
+        self.proc.stdin.write((self.SHM_NAME + "\n").encode("ascii"))
         self.proc.stdin.flush()
 
-        # 少し待ってから SHM オープン
-        time.sleep(0.15)
+        time.sleep(0.1)
         self.shm = mmap.mmap(-1, self.SHM_SIZE, self.SHM_NAME)
 
-        # 起動直後の1行を排水（シリアル等）
+        # 起動直後のノイズを軽く排水
         _ = self._readline(self._pipe, 1.0)
         if self.debug and _:
             print("[cam-exe]", _.decode("utf-8", "ignore").strip())
@@ -70,32 +68,22 @@ class FixedCamera:
         if t.is_alive(): return b""
         return q.get()
 
-    def _spam_commands(self, duration_sec=1.2):
-        """
-        wcin/cin どっちでも反応するように
-        - ASCII: 'capture\\r\\n' と 'capture\\n'
-        - UTF-16LE: 'capture\\r\\n'
-        を 50ms ごとに交互送信
-        """
+    def _spam_commands(self, duration_sec=0.8):
+        """cin/wcin どちらでも拾えるよう、ASCII/UTF-16LE を短時間に交互送信"""
         ascii_crlf = b"capture\r\n"
         ascii_lf   = b"capture\n"
         wide_crlf  = "capture".encode("utf-16le") + b"\x0d\x00\x0a\x00"
-
         t_end = time.time() + duration_sec
         i = 0
         while time.time() < t_end:
             try:
-                if i % 3 == 0:
-                    self.proc.stdin.write(ascii_crlf)
-                elif i % 3 == 1:
-                    self.proc.stdin.write(ascii_lf)
-                else:
-                    self.proc.stdin.write(wide_crlf)
+                if i % 3 == 0:   self.proc.stdin.write(ascii_crlf)
+                elif i % 3 == 1: self.proc.stdin.write(ascii_lf)
+                else:            self.proc.stdin.write(wide_crlf)
                 self.proc.stdin.flush()
             except Exception:
                 break
-            # ログを軽く排水
-            _ = self._readline(self._pipe, 0.01)
+            _ = self._readline(self._pipe, 0.01)  # 排水
             i += 1
             time.sleep(0.05)
 
@@ -103,48 +91,29 @@ class FixedCamera:
         if self.proc.poll() is not None:
             raise RuntimeError("CAM1.exe が終了しています。")
 
-        # 差分検知のためのスナップショット
-        probe_len = min(65536, self.SHM_SIZE)
-        self.shm.seek(0); before = self.shm.read(probe_len); self.shm.seek(0)
+        # 通常のキャプチャ
+        self.proc.stdin.write(b"capture\n")
+        self.proc.stdin.flush()
 
-        # まずは通常の1発送信（CRLF）
-        try:
-            self.proc.stdin.write(b"capture\r\n")
-            self.proc.stdin.flush()
-        except Exception:
-            pass
-
-        # 0.7秒だけ Done!/SUM を待つ
-        end = time.time() + 0.7
+        # Done! を待つ（最大2秒）
+        end = time.time() + 2.0
         done = False
         while time.time() < end:
-            line = self._readline(self._pipe, 0.15)
-            if not line:
+            line = self._readline(self._pipe, 0.2)
+            if not line: 
                 continue
-            s = line.decode("utf-8", "ignore").strip()
-            if self.debug and s:
-                print("[cam-exe]", s)
-            low = s.lower()
-            if "done" in low or low.startswith("sum "):
+            if b"Done!" in line:
                 done = True
                 break
 
-        # 反応薄ければスパム送信＋差分待ち
+        # 保険（Done!が来ない環境向け）
         if not done:
-            self._spam_commands(duration_sec=1.2)
+            self._spam_commands(0.8)
 
-        # 共有メモリの中身が変わるまで最大 1.5 秒監視
-        end2 = time.time() + 1.5
-        changed = False
-        while time.time() < end2:
-            self.shm.seek(0); cur = self.shm.read(probe_len); self.shm.seek(0)
-            if cur != before:
-                changed = True
-                break
-            time.sleep(0.01)
+        # 共有メモリから読み出し
+        buf = self.shm.read(self.SHM_SIZE)
+        self.shm.seek(0)
 
-        # 読み出し（上下反転なし）
-        buf = self.shm.read(self.SHM_SIZE); self.shm.seek(0)
         row = np.frombuffer(buf, np.uint8).reshape(self.H, self.STRIDE)
         valid = row[:, : self.W * self.BYTES_PER_PIXEL]
         if self.BPP == 32:
@@ -154,15 +123,12 @@ class FixedCamera:
         else:
             c = max(1, self.BYTES_PER_PIXEL)
             img = valid.reshape(self.H, self.W, c)[:, :, :3]
-
-        if self.debug:
-            print(f"[cam] changed={changed}")
         return img
 
     def close(self):
         try:
             if self.proc and self.proc.stdin:
-                # finalize も ASCII と UTF-16LE 両方
+                # finalize は両方式で
                 try:
                     self.proc.stdin.write(b"finalize\r\n"); self.proc.stdin.flush()
                 except Exception: pass

@@ -1,6 +1,5 @@
 // CamBridge.cpp - Console bridge for Python (no PCH)
 #include "stdafx.h"
-#include <windows.h>
 #include <iostream>
 #include <string>
 #include <memory>
