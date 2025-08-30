@@ -1,0 +1,37 @@
+# ==== Visual Studio / MSBuild ====
+.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+
+# ==== Build outputs ====
+x64/
+x86/
+Debug/
+Release/
+ipch/
+*.obj
+*.iobj
+*.pdb
+*.ipdb
+*.idb
+*.ilk
+*.tlog
+*.log
+*.pch
+*.cache
+*.tmp
+
+# ==== Binaries / SDK stuff (コミットしない) ====
+*.exe
+*.dll
+*.lib
+
+# ==== 大きい画像やサンプル出力（必要なら別リポ/Artifactsへ） ====
+*.bmp
+*.png
+*.jpg
+
+# ==== その他（不要なら調整してください） ====
+*.lastcodeanalysissucceeded
