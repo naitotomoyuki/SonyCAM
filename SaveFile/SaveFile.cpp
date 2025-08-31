@@ -72,8 +72,10 @@ int main() {
     cam->SetFeature("ExposureAuto", "Off");
     cam->SetFeature("GainAuto", "Off");
     cam->SetFeature("ExposureTime", 10000.0); // 10ms
-    cam->SetFeature("Gain", 6.0);
+    cam->SetFeature("Gain", 18.0);
     cam->SetFeature("PixelFormat", "RGB8Packed");
+    cam->SetFeature("ReverseX", "Off");
+    cam->SetFeature("ReverseY", "Off");
     // 必要なら PixelFormat を明示（機種依存。無視される場合あり）
     //cam->SetFeature("PixelFormat", "BGR8");  // DIB が 32bpp なら未指定でOK
 
